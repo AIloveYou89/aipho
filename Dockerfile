@@ -12,11 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY aipho/requirements.txt .
 RUN python3 -m pip install --upgrade pip && pip3 install -r requirements.txt
 
 # Handler (đổi tên theo ý bạn)
-COPY st_handler.py .
+COPY aipho/st_handler.py .
 
 # DÙNG MODEL CT2 SẴN (không convert khi build)
 ENV MODEL_ID="kiendt/PhoWhisper-large-ct2" \
