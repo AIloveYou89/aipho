@@ -1,5 +1,5 @@
 # PhoWhisper (VinAI) on faster-whisper / CTranslate2 – Runpod Serverless
-# st_handler.py - Fixed hallucination/repetition
+# st_handler.py - Auto-split subtitles + Fixed hallucination
 # Updated: 2025-10-30
 
 import os, uuid, time, json, logging, tempfile, subprocess, math, shutil
@@ -22,11 +22,15 @@ LANG         = os.getenv("LANG", "vi")
 VAD_FILTER   = os.getenv("VAD_FILTER", "1") == "1"
 MAX_CHUNK    = float(os.getenv("MAX_CHUNK_LEN", "30"))
 
-# ✨ THÊM CÁC THAM SỐ CHỐNG HALLUCINATION
-NO_SPEECH_TH = float(os.getenv("NO_SPEECH_THRESHOLD", "0.6"))        # Tăng từ 0.6 -> lọc segment im lặng tốt hơn
-LOGPROB_TH   = float(os.getenv("LOGPROB_THRESHOLD", "-1.0"))         # Lọc segment có độ tin cậy thấp
-COMPRESSION_TH = float(os.getenv("COMPRESSION_RATIO_THRESHOLD", "2.4"))  # Lọc segment lặp lại
-MIN_SEGMENT_DURATION = float(os.getenv("MIN_SEGMENT_DURATION", "0.3"))  # Bỏ segment < 300ms
+# Chống hallucination
+NO_SPEECH_TH = float(os.getenv("NO_SPEECH_THRESHOLD", "0.6"))
+LOGPROB_TH   = float(os.getenv("LOGPROB_THRESHOLD", "-1.0"))
+COMPRESSION_TH = float(os.getenv("COMPRESSION_RATIO_THRESHOLD", "2.4"))
+MIN_SEGMENT_DURATION = float(os.getenv("MIN_SEGMENT_DURATION", "0.3"))
+
+# ✨ THAM SỐ CHIA SUBTITLE
+MAX_CHARS_PER_LINE = int(os.getenv("MAX_CHARS_PER_LINE", "80"))      # Tối đa 80 ký tự/dòng
+MAX_DURATION_PER_LINE = float(os.getenv("MAX_DURATION_PER_LINE", "7"))  # Tối đa 7 giây/dòng
 
 MAKE_SRT     = os.getenv("SRT", "1") == "1"
 MAKE_VTT     = os.getenv("VTT", "0") == "1"
@@ -111,33 +115,81 @@ def _normalize_input(inp: Dict[str, Any]) -> Tuple[str, str]:
     _to_wav_16k_mono(raw, fixed)
     return fixed, tmp_dir
 
-# ✨ THÊM HÀM LỌC HALLUCINATION
 def _is_valid_segment(seg, prev_text: str = "") -> bool:
-    """
-    Lọc bỏ segments không hợp lệ:
-    - Quá ngắn (< MIN_SEGMENT_DURATION)
-    - Lặp lại đoạn trước
-    - Chỉ chứa ký tự đặc biệt/noise
-    """
+    """Lọc bỏ segments không hợp lệ"""
     duration = seg.end - seg.start
     text = seg.text.strip()
     
-    # Bỏ segment quá ngắn
     if duration < MIN_SEGMENT_DURATION:
         log.debug(f"[FILTER] Skipped short segment ({duration:.3f}s): {text[:30]}")
         return False
     
-    # Bỏ segment rỗng hoặc chỉ có ký tự đặc biệt
     if not text or len(text) < 3:
         log.debug(f"[FILTER] Skipped empty/short text: '{text}'")
         return False
     
-    # Bỏ segment lặp lại đoạn trước (hallucination)
     if prev_text and text in prev_text:
         log.debug(f"[FILTER] Skipped repetition: {text[:30]}")
         return False
     
     return True
+
+# ✨ HÀM CHIA SEGMENTS THÀNH DÒNG NGẮN
+def _split_segment_by_words(seg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Chia 1 segment dài thành nhiều dòng ngắn dựa trên:
+    - Số ký tự (MAX_CHARS_PER_LINE)
+    - Duration (MAX_DURATION_PER_LINE)
+    - Word timestamps
+    """
+    words = seg.get("words", [])
+    if not words:
+        # Nếu không có word timestamps, giữ nguyên
+        return [seg]
+    
+    result_segments = []
+    current_words = []
+    current_text = ""
+    start_time = words[0]["start"]
+    
+    for i, word in enumerate(words):
+        word_text = word["word"]
+        
+        # Thử thêm word vào dòng hiện tại
+        test_text = current_text + word_text
+        test_duration = word["end"] - start_time
+        
+        # Kiểm tra có vượt giới hạn không
+        should_break = (
+            len(test_text) > MAX_CHARS_PER_LINE or 
+            test_duration > MAX_DURATION_PER_LINE
+        )
+        
+        if should_break and current_words:
+            # Lưu dòng hiện tại
+            result_segments.append({
+                "start": start_time,
+                "end": current_words[-1]["end"],
+                "text": current_text.strip()
+            })
+            # Bắt đầu dòng mới
+            current_words = [word]
+            current_text = word_text
+            start_time = word["start"]
+        else:
+            # Thêm vào dòng hiện tại
+            current_words.append(word)
+            current_text = test_text
+    
+    # Thêm dòng cuối cùng
+    if current_words:
+        result_segments.append({
+            "start": start_time,
+            "end": current_words[-1]["end"],
+            "text": current_text.strip()
+        })
+    
+    return result_segments
 
 # -----------------------------
 # Handler
@@ -155,7 +207,7 @@ def handler(event):
 
     beam_size   = int(inp.get("beam_size", 5))
     temperature = float(inp.get("temperature", 0.0))
-    word_ts     = bool(inp.get("word_timestamps", True))
+    word_ts     = True  # ✨ LUÔN BẬT word timestamps để chia dòng
     lang = None if str(LANG).lower() == "auto" else LANG
 
     job_id  = str(uuid.uuid4())
@@ -176,8 +228,7 @@ def handler(event):
             temperature=temperature,
             word_timestamps=word_ts,
             chunk_length=MAX_CHUNK,
-            # ✨ THÊM CÁC THAM SỐ CHỐNG HALLUCINATION
-            condition_on_previous_text=False,        # QUAN TRỌNG: Tắt context từ đoạn trước
+            condition_on_previous_text=False,
             no_speech_threshold=NO_SPEECH_TH,
             log_prob_threshold=LOGPROB_TH,
             compression_ratio_threshold=COMPRESSION_TH
@@ -188,14 +239,12 @@ def handler(event):
         log.error(f"[ASR] {e}")
         return {"error": f"Transcribe failed: {e}"}
 
-    segments: List[Dict[str, Any]] = []
+    raw_segments: List[Dict[str, Any]] = []
     words_all: List[Dict[str, Any]] = []
-    texts: List[str] = []
     prev_text = ""
 
-    # ✨ THÊM LOGIC LỌC KHI XỬ LÝ SEGMENTS
+    # Thu thập segments từ model
     for seg in segments_gen:
-        # Kiểm tra segment có hợp lệ không
         if not _is_valid_segment(seg, prev_text):
             continue
         
@@ -203,19 +252,31 @@ def handler(event):
             "id": seg.id,
             "start": float(seg.start),
             "end": float(seg.end),
-            "text": seg.text.strip()
+            "text": seg.text.strip(),
+            "words": []
         }
         
-        if word_ts and seg.words:
+        if seg.words:
             item["words"] = [{"start": float(w.start), "end": float(w.end), "word": w.word} for w in seg.words]
             words_all.extend(item["words"])
         
-        segments.append(item)
-        texts.append(item["text"])
-        prev_text = " ".join(texts[-3:])  # Nhớ 3 đoạn gần nhất để check lặp
+        raw_segments.append(item)
+        prev_text = " ".join([s["text"] for s in raw_segments[-3:]])
+
+    # ✨ CHIA SEGMENTS THÀNH DÒNG NGẮN
+    final_segments = []
+    for seg in raw_segments:
+        split_segs = _split_segment_by_words(seg)
+        final_segments.extend(split_segs)
+    
+    log.info(f"[SPLIT] {len(raw_segments)} raw segments → {len(final_segments)} final lines")
+
+    # Re-index segments
+    for i, seg in enumerate(final_segments, 1):
+        seg["id"] = i
 
     elapsed = round(time.time() - t0, 2)
-    log.info(f"[DONE] {len(segments)} segments | {elapsed}s")
+    log.info(f"[DONE] {len(final_segments)} lines | {elapsed}s")
 
     result = {
         "job_id": job_id,
@@ -223,10 +284,10 @@ def handler(event):
         "language": info.language,
         "language_probability": float(info.language_probability),
         "elapsed_sec": elapsed,
-        "num_segments": len(segments),
+        "num_segments": len(final_segments),
         "num_words": len(words_all),
-        "text": " ".join(texts).strip(),
-        "segments": segments,
+        "text": " ".join([s["text"] for s in final_segments]).strip(),
+        "segments": final_segments,
         "outputs": {"json": json_p, "srt": None, "vtt": None}
     }
 
@@ -235,10 +296,10 @@ def handler(event):
 
     try:
         if MAKE_SRT:
-            _write_srt(segments, srt_p)
+            _write_srt(final_segments, srt_p)
             result["outputs"]["srt"] = srt_p
         if MAKE_VTT:
-            _write_vtt(segments, vtt_p)
+            _write_vtt(final_segments, vtt_p)
             result["outputs"]["vtt"] = vtt_p
     except Exception as e:
         log.warning(f"[SUBTITLE] {e}")
