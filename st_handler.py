@@ -29,8 +29,9 @@ COMPRESSION_TH = float(os.getenv("COMPRESSION_RATIO_THRESHOLD", "2.4"))
 MIN_SEGMENT_DURATION = float(os.getenv("MIN_SEGMENT_DURATION", "0.3"))
 
 # ✨ THAM SỐ CHIA SUBTITLE
-MAX_CHARS_PER_LINE = int(os.getenv("MAX_CHARS_PER_LINE", "80"))      # Tối đa 80 ký tự/dòng
-MAX_DURATION_PER_LINE = float(os.getenv("MAX_DURATION_PER_LINE", "7"))  # Tối đa 7 giây/dòng
+# Giữ dòng ngắn, ~2s/dòng & "vài chữ"
+MAX_CHARS_PER_LINE = int(os.getenv("MAX_CHARS_PER_LINE", "28"))          # (đổi mặc định 80 -> 28)
+MAX_DURATION_PER_LINE = float(os.getenv("MAX_DURATION_PER_LINE", "2"))   # (đổi mặc định 7 -> 2)
 
 MAKE_SRT     = os.getenv("SRT", "1") == "1"
 MAKE_VTT     = os.getenv("VTT", "0") == "1"
@@ -139,27 +140,31 @@ def _split_segment_by_words(seg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Chia 1 segment dài thành nhiều dòng ngắn dựa trên:
     - Số ký tự (MAX_CHARS_PER_LINE)
-    - Duration (MAX_DURATION_PER_LINE)
+    - Duration (MAX_DURATION_PER_LINE, mặc định ~2s)
     - Word timestamps
+    - Sửa lỗi dính chữ (thêm khoảng trắng phù hợp)
     """
     words = seg.get("words", [])
     if not words:
-        # Nếu không có word timestamps, giữ nguyên
+        # Nếu không có word timestamps, giữ nguyên (rất hiếm vì word_ts=True)
         return [seg]
     
     result_segments = []
-    current_words = []
+    current_words: List[Dict[str, Any]] = []
     current_text = ""
     start_time = words[0]["start"]
     
+    # Ký tự không cần khoảng trắng phía trước (dấu câu)
+    no_space_prefix = set(",.!?;:…)]}»”’")
+
     for i, word in enumerate(words):
         word_text = word["word"]
-        
-        # Thử thêm word vào dòng hiện tại
-        test_text = current_text + word_text
+        # Ghép thử với khoảng trắng hợp lý để tránh dính chữ
+        sep = "" if (not current_text or (word_text and word_text[0] in no_space_prefix)) else " "
+        test_text = current_text + sep + word_text
         test_duration = word["end"] - start_time
-        
-        # Kiểm tra có vượt giới hạn không
+
+        # Ngắt dòng nếu vượt giới hạn ký tự hoặc quá ~2s
         should_break = (
             len(test_text) > MAX_CHARS_PER_LINE or 
             test_duration > MAX_DURATION_PER_LINE
@@ -172,7 +177,7 @@ def _split_segment_by_words(seg: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "end": current_words[-1]["end"],
                 "text": current_text.strip()
             })
-            # Bắt đầu dòng mới
+            # Bắt đầu dòng mới với từ hiện tại
             current_words = [word]
             current_text = word_text
             start_time = word["start"]
@@ -263,8 +268,8 @@ def handler(event):
         raw_segments.append(item)
         prev_text = " ".join([s["text"] for s in raw_segments[-3:]])
 
-    # ✨ CHIA SEGMENTS THÀNH DÒNG NGẮN
-    final_segments = []
+    # ✨ CHIA SEGMENTS THÀNH DÒNG NGẮN (~2s/dòng, ít chữ)
+    final_segments: List[Dict[str, Any]] = []
     for seg in raw_segments:
         split_segs = _split_segment_by_words(seg)
         final_segments.extend(split_segs)
