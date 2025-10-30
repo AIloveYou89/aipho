@@ -1,5 +1,6 @@
 runpod>=1.7.10
-faster-whisper>=1.0.0
+faster-whisper==1.0.1
+ctranslate2>=4.4,<5
 ffmpeg-python>=0.2.0
 soundfile>=0.12.1
 numpy>=1.26.0
