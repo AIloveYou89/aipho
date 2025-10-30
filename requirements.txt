@@ -1,0 +1,6 @@
+runpod>=1.7.10
+faster-whisper>=1.0.0
+ffmpeg-python>=0.2.0
+soundfile>=0.12.1
+numpy>=1.26.0
+requests>=2.31.0
