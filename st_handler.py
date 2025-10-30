@@ -1,5 +1,5 @@
 # PhoWhisper (VinAI) on faster-whisper / CTranslate2 — Runpod Serverless
-# st_handler.py — patched to reduce end-of-file repeats and improve VAD chunking
+# st_handler.py
 # Updated: 2025-10-30
 
 import os, uuid, time, json, logging, tempfile, subprocess, math, shutil
@@ -9,9 +9,9 @@ import runpod
 import requests
 from faster_whisper import WhisperModel
 
-# =========================
-# ENV (override khi deploy)
-# =========================
+# -----------------------------
+# ENV (override bằng ENV khi deploy)
+# -----------------------------
 MODEL_ID     = os.getenv("MODEL_ID", "kiendt/PhoWhisper-large-ct2")  # HF repo CT2 đã convert
 MODEL_DIR    = os.getenv("MODEL_DIR", "/models")                     # nơi cache model CT2
 OUT_DIR      = os.getenv("OUT_DIR", "/runpod-volume/out")
@@ -21,12 +21,6 @@ COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16")                  # float16 |
 LANG         = os.getenv("LANG", "vi")                               # "vi" hoặc "auto"
 VAD_FILTER   = os.getenv("VAD_FILTER", "1") == "1"                   # cắt lặng
 MAX_CHUNK    = float(os.getenv("MAX_CHUNK_LEN", "30"))               # giây, cho long-form
-
-# Patch chống lặp/đứt cuối câu
-COND_PREV    = os.getenv("COND_PREV", "1") == "1"                    # condition_on_previous_text
-NO_SPEECH_TH = float(os.getenv("NO_SPEECH_THRESHOLD", "0.7"))        # bỏ near-silence
-VAD_MIN_SIL  = int(os.getenv("VAD_MIN_SIL_MS", "600"))               # ms im lặng để cắt
-
 MAKE_SRT     = os.getenv("SRT", "1") == "1"
 MAKE_VTT     = os.getenv("VTT", "0") == "1"
 
@@ -35,27 +29,27 @@ os.makedirs(OUT_DIR, exist_ok=True)
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("PhoWhisper-Serverless")
 
-# =========================
+# -----------------------------
 # Lazy model loader
-# =========================
+# -----------------------------
 _model: Optional[WhisperModel] = None
 def get_model() -> WhisperModel:
     global _model
     if _model is None:
         log.info(f"[MODEL] Loading: {MODEL_ID} (device={DEVICE}, compute_type={COMPUTE_TYPE})")
         _model = WhisperModel(
-            MODEL_ID,
+            MODEL_ID,                          # tên model (HF CT2)
             device=DEVICE,
             compute_type=COMPUTE_TYPE,
-            download_root=MODEL_DIR
+            download_root=MODEL_DIR            # cache vào /models
         )
         log.info("[MODEL] Loaded successfully.")
     return _model
 
-# =========================
+# -----------------------------
 # Utils
-# =========================
-def _download(url: str, to_path: str, timeout: int = 300) -> str:
+# -----------------------------
+def _download(url: str, to_path: str, timeout: int = 180) -> str:
     log.info(f"[DOWNLOAD] {url}")
     with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
@@ -117,31 +111,21 @@ def _normalize_input(inp: Dict[str, Any]) -> Tuple[str, str]:
     _to_wav_16k_mono(raw, fixed)
     return fixed, tmp_dir
 
-def strip_overlap(prev_text: str, curr_text: str, max_overlap: int = 24) -> str:
-    """Gọt phần trùng giữa đuôi đoạn trước và đầu đoạn hiện tại (chống lặp)."""
-    prev_tail = prev_text[-max_overlap:].lower()
-    t = curr_text.strip()
-    # thử từ dài -> ngắn để ưu tiên khớp dài
-    for m in range(min(len(t), max_overlap), 6, -1):
-        if prev_tail.endswith(t[:m].lower()):
-            return t[m:].lstrip()
-    return t
-
-# =========================
+# -----------------------------
 # Handler
-# =========================
+# -----------------------------
 def handler(event):
     """
     Input JSON:
-    {
-      "audio_path": "/runpod-volume/audio/test.wav",  // hoặc
-      "audio_url": "https://.../sample.mp3",
-      "beam_size": 5,
-      "temperature": 0.2,
-      "word_timestamps": true,
-      "return": "json|text",
-      "outfile_prefix": "pho_demo"
-    }
+      {
+        "audio_path": "/runpod-volume/audio/test.wav",  # hoặc
+        "audio_url": "https://.../sample.mp3",
+        "beam_size": 5,
+        "temperature": 0.0,
+        "word_timestamps": true,
+        "return": "json|text",
+        "outfile_prefix": "pho_demo"
+      }
     """
     t0 = time.time()
     inp = event.get("input", {}) if isinstance(event, dict) else {}
@@ -154,7 +138,7 @@ def handler(event):
         return {"error": f"Input error: {e}"}
 
     beam_size   = int(inp.get("beam_size", 5))
-    temperature = float(inp.get("temperature", 0.2))
+    temperature = float(inp.get("temperature", 0.0))
     word_ts     = bool(inp.get("word_timestamps", True))
     lang = None if str(LANG).lower() == "auto" else LANG
 
@@ -172,17 +156,10 @@ def handler(event):
             language=lang,
             task="transcribe",
             vad_filter=VAD_FILTER,
-            vad_parameters={"min_silence_duration_ms": VAD_MIN_SIL},
             beam_size=beam_size,
             temperature=temperature,
             word_timestamps=word_ts,
-            chunk_length=MAX_CHUNK,
-            condition_on_previous_text=COND_PREV,
-            no_speech_threshold=NO_SPEECH_TH,
-            compression_ratio_threshold=2.6,
-            log_prob_threshold=-0.5,
-            suppress_blank=True,
-            suppress_non_speech_tokens=True
+            chunk_length=MAX_CHUNK
         )
     except Exception as e:
         if tmp_dir and os.path.exists(tmp_dir):
@@ -204,14 +181,8 @@ def handler(event):
         if word_ts and seg.words:
             item["words"] = [{"start": float(w.start), "end": float(w.end), "word": w.word} for w in seg.words]
             words_all.extend(item["words"])
-
-        # Chống lặp giữa các segment (đặc biệt ở ranh giới chunk)
-        joined = " ".join(texts)
-        clean = strip_overlap(joined, item["text"])
-        item["text"] = clean
-
         segments.append(item)
-        texts.append(clean)
+        texts.append(item["text"])
 
     elapsed = round(time.time() - t0, 2)
     log.info(f"[DONE] {len(segments)} segments | {elapsed}s")
@@ -262,8 +233,8 @@ def handler(event):
         }
     return result
 
-# =========================
-# Runpod serverless entry
-# =========================
+# -----------------------------
+# Runpod serverless entrypoint
+# -----------------------------
 log.info("[INIT] Starting Runpod serverless worker…")
 runpod.serverless.start({"handler": handler})
