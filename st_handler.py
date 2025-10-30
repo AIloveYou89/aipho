@@ -1,5 +1,5 @@
-# PhoWhisper (VinAI) on faster-whisper / CTranslate2 — Runpod Serverless
-# st_handler.py
+# PhoWhisper (VinAI) on faster-whisper / CTranslate2 – Runpod Serverless
+# st_handler.py - Fixed hallucination/repetition
 # Updated: 2025-10-30
 
 import os, uuid, time, json, logging, tempfile, subprocess, math, shutil
@@ -10,17 +10,24 @@ import requests
 from faster_whisper import WhisperModel
 
 # -----------------------------
-# ENV (override bằng ENV khi deploy)
+# ENV
 # -----------------------------
-MODEL_ID     = os.getenv("MODEL_ID", "kiendt/PhoWhisper-large-ct2")  # HF repo CT2 đã convert
-MODEL_DIR    = os.getenv("MODEL_DIR", "/models")                     # nơi cache model CT2
+MODEL_ID     = os.getenv("MODEL_ID", "kiendt/PhoWhisper-large-ct2")
+MODEL_DIR    = os.getenv("MODEL_DIR", "/models")
 OUT_DIR      = os.getenv("OUT_DIR", "/runpod-volume/out")
 
-DEVICE       = os.getenv("DEVICE", "cuda")                           # cuda | cpu
-COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16")                  # float16 | int8_float16 | int8
-LANG         = os.getenv("LANG", "vi")                               # "vi" hoặc "auto"
-VAD_FILTER   = os.getenv("VAD_FILTER", "1") == "1"                   # cắt lặng
-MAX_CHUNK    = float(os.getenv("MAX_CHUNK_LEN", "30"))               # giây, cho long-form
+DEVICE       = os.getenv("DEVICE", "cuda")
+COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16")
+LANG         = os.getenv("LANG", "vi")
+VAD_FILTER   = os.getenv("VAD_FILTER", "1") == "1"
+MAX_CHUNK    = float(os.getenv("MAX_CHUNK_LEN", "30"))
+
+# ✨ THÊM CÁC THAM SỐ CHỐNG HALLUCINATION
+NO_SPEECH_TH = float(os.getenv("NO_SPEECH_THRESHOLD", "0.6"))        # Tăng từ 0.6 -> lọc segment im lặng tốt hơn
+LOGPROB_TH   = float(os.getenv("LOGPROB_THRESHOLD", "-1.0"))         # Lọc segment có độ tin cậy thấp
+COMPRESSION_TH = float(os.getenv("COMPRESSION_RATIO_THRESHOLD", "2.4"))  # Lọc segment lặp lại
+MIN_SEGMENT_DURATION = float(os.getenv("MIN_SEGMENT_DURATION", "0.3"))  # Bỏ segment < 300ms
+
 MAKE_SRT     = os.getenv("SRT", "1") == "1"
 MAKE_VTT     = os.getenv("VTT", "0") == "1"
 
@@ -38,10 +45,10 @@ def get_model() -> WhisperModel:
     if _model is None:
         log.info(f"[MODEL] Loading: {MODEL_ID} (device={DEVICE}, compute_type={COMPUTE_TYPE})")
         _model = WhisperModel(
-            MODEL_ID,                          # tên model (HF CT2)
+            MODEL_ID,
             device=DEVICE,
             compute_type=COMPUTE_TYPE,
-            download_root=MODEL_DIR            # cache vào /models
+            download_root=MODEL_DIR
         )
         log.info("[MODEL] Loaded successfully.")
     return _model
@@ -60,7 +67,6 @@ def _download(url: str, to_path: str, timeout: int = 180) -> str:
     return to_path
 
 def _to_wav_16k_mono(src_path: str, dst_path: str) -> str:
-    """Chuẩn hoá audio về 16kHz mono s16 bằng ffmpeg"""
     cmd = ["ffmpeg", "-y", "-i", src_path, "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", dst_path]
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if res.returncode != 0:
@@ -87,12 +93,6 @@ def _write_vtt(segments: List[Dict[str, Any]], path: str) -> None:
             f.write(f"{s} --> {e}\n{seg['text'].strip()}\n\n")
 
 def _normalize_input(inp: Dict[str, Any]) -> Tuple[str, str]:
-    """
-    Hỗ trợ:
-      - audio_path: đường dẫn local (đã mount volume)
-      - audio_url : link http(s) để tải về rồi xử lý
-    Trả về: (wav_16k_path, tmp_dir)
-    """
     audio_path = inp.get("audio_path")
     audio_url  = inp.get("audio_url")
     if not audio_path and not audio_url:
@@ -111,22 +111,38 @@ def _normalize_input(inp: Dict[str, Any]) -> Tuple[str, str]:
     _to_wav_16k_mono(raw, fixed)
     return fixed, tmp_dir
 
+# ✨ THÊM HÀM LỌC HALLUCINATION
+def _is_valid_segment(seg, prev_text: str = "") -> bool:
+    """
+    Lọc bỏ segments không hợp lệ:
+    - Quá ngắn (< MIN_SEGMENT_DURATION)
+    - Lặp lại đoạn trước
+    - Chỉ chứa ký tự đặc biệt/noise
+    """
+    duration = seg.end - seg.start
+    text = seg.text.strip()
+    
+    # Bỏ segment quá ngắn
+    if duration < MIN_SEGMENT_DURATION:
+        log.debug(f"[FILTER] Skipped short segment ({duration:.3f}s): {text[:30]}")
+        return False
+    
+    # Bỏ segment rỗng hoặc chỉ có ký tự đặc biệt
+    if not text or len(text) < 3:
+        log.debug(f"[FILTER] Skipped empty/short text: '{text}'")
+        return False
+    
+    # Bỏ segment lặp lại đoạn trước (hallucination)
+    if prev_text and text in prev_text:
+        log.debug(f"[FILTER] Skipped repetition: {text[:30]}")
+        return False
+    
+    return True
+
 # -----------------------------
 # Handler
 # -----------------------------
 def handler(event):
-    """
-    Input JSON:
-      {
-        "audio_path": "/runpod-volume/audio/test.wav",  # hoặc
-        "audio_url": "https://.../sample.mp3",
-        "beam_size": 5,
-        "temperature": 0.0,
-        "word_timestamps": true,
-        "return": "json|text",
-        "outfile_prefix": "pho_demo"
-      }
-    """
     t0 = time.time()
     inp = event.get("input", {}) if isinstance(event, dict) else {}
     tmp_dir = None
@@ -159,7 +175,12 @@ def handler(event):
             beam_size=beam_size,
             temperature=temperature,
             word_timestamps=word_ts,
-            chunk_length=MAX_CHUNK
+            chunk_length=MAX_CHUNK,
+            # ✨ THÊM CÁC THAM SỐ CHỐNG HALLUCINATION
+            condition_on_previous_text=False,        # QUAN TRỌNG: Tắt context từ đoạn trước
+            no_speech_threshold=NO_SPEECH_TH,
+            log_prob_threshold=LOGPROB_TH,
+            compression_ratio_threshold=COMPRESSION_TH
         )
     except Exception as e:
         if tmp_dir and os.path.exists(tmp_dir):
@@ -170,19 +191,28 @@ def handler(event):
     segments: List[Dict[str, Any]] = []
     words_all: List[Dict[str, Any]] = []
     texts: List[str] = []
+    prev_text = ""
 
+    # ✨ THÊM LOGIC LỌC KHI XỬ LÝ SEGMENTS
     for seg in segments_gen:
+        # Kiểm tra segment có hợp lệ không
+        if not _is_valid_segment(seg, prev_text):
+            continue
+        
         item = {
             "id": seg.id,
             "start": float(seg.start),
             "end": float(seg.end),
             "text": seg.text.strip()
         }
+        
         if word_ts and seg.words:
             item["words"] = [{"start": float(w.start), "end": float(w.end), "word": w.word} for w in seg.words]
             words_all.extend(item["words"])
+        
         segments.append(item)
         texts.append(item["text"])
+        prev_text = " ".join(texts[-3:])  # Nhớ 3 đoạn gần nhất để check lặp
 
     elapsed = round(time.time() - t0, 2)
     log.info(f"[DONE] {len(segments)} segments | {elapsed}s")
@@ -200,7 +230,6 @@ def handler(event):
         "outputs": {"json": json_p, "srt": None, "vtt": None}
     }
 
-    # Lưu JSON + phụ đề (tuỳ chọn)
     with open(json_p, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
@@ -214,14 +243,12 @@ def handler(event):
     except Exception as e:
         log.warning(f"[SUBTITLE] {e}")
 
-    # Cleanup
     if tmp_dir and os.path.exists(tmp_dir):
         try:
             shutil.rmtree(tmp_dir)
         except Exception as e:
             log.warning(f"[CLEANUP] {e}")
 
-    # Kiểu trả về
     if inp.get("return", "json") == "text":
         return {
             "job_id": job_id,
