@@ -1,8 +1,8 @@
 # PhoWhisper (VinAI) on faster-whisper / CTranslate2 – Runpod Serverless
 # st_handler.py - Auto-split subtitles + Fixed hallucination
-# Updated: 2025-10-30
+# Updated: 2025-10-30 - SRT OUTPUT ONLY VERSION
 
-import os, uuid, time, json, logging, tempfile, subprocess, math, shutil
+import os, uuid, time, logging, tempfile, subprocess, math, shutil
 from typing import Dict, Any, List, Optional, Tuple
 
 import runpod
@@ -29,12 +29,8 @@ COMPRESSION_TH = float(os.getenv("COMPRESSION_RATIO_THRESHOLD", "2.4"))
 MIN_SEGMENT_DURATION = float(os.getenv("MIN_SEGMENT_DURATION", "0.3"))
 
 # ✨ THAM SỐ CHIA SUBTITLE
-# Giữ dòng ngắn, ~2s/dòng & "vài chữ"
-MAX_CHARS_PER_LINE = int(os.getenv("MAX_CHARS_PER_LINE", "28"))          # (đổi mặc định 80 -> 28)
-MAX_DURATION_PER_LINE = float(os.getenv("MAX_DURATION_PER_LINE", "2"))   # (đổi mặc định 7 -> 2)
-
-MAKE_SRT     = os.getenv("SRT", "1") == "1"
-MAKE_VTT     = os.getenv("VTT", "0") == "1"
+MAX_CHARS_PER_LINE = int(os.getenv("MAX_CHARS_PER_LINE", "28"))
+MAX_DURATION_PER_LINE = float(os.getenv("MAX_DURATION_PER_LINE", "2"))
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -89,14 +85,6 @@ def _write_srt(segments: List[Dict[str, Any]], path: str) -> None:
         for i, seg in enumerate(segments, 1):
             f.write(f"{i}\n{_fmt_ts(seg['start'])} --> {_fmt_ts(seg['end'])}\n{seg['text'].strip()}\n\n")
 
-def _write_vtt(segments: List[Dict[str, Any]], path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("WEBVTT\n\n")
-        for seg in segments:
-            s = _fmt_ts(seg["start"]).replace(",", ".")
-            e = _fmt_ts(seg["end"]).replace(",", ".")
-            f.write(f"{s} --> {e}\n{seg['text'].strip()}\n\n")
-
 def _normalize_input(inp: Dict[str, Any]) -> Tuple[str, str]:
     audio_path = inp.get("audio_path")
     audio_url  = inp.get("audio_url")
@@ -146,7 +134,6 @@ def _split_segment_by_words(seg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     words = seg.get("words", [])
     if not words:
-        # Nếu không có word timestamps, giữ nguyên (rất hiếm vì word_ts=True)
         return [seg]
     
     result_segments = []
@@ -154,39 +141,32 @@ def _split_segment_by_words(seg: Dict[str, Any]) -> List[Dict[str, Any]]:
     current_text = ""
     start_time = words[0]["start"]
     
-    # Ký tự không cần khoảng trắng phía trước (dấu câu)
-    no_space_prefix = set(",.!?;:…)]}»”’")
+    no_space_prefix = set(",.!?;:…)]}»""'")
 
     for i, word in enumerate(words):
         word_text = word["word"]
-        # Ghép thử với khoảng trắng hợp lý để tránh dính chữ
         sep = "" if (not current_text or (word_text and word_text[0] in no_space_prefix)) else " "
         test_text = current_text + sep + word_text
         test_duration = word["end"] - start_time
 
-        # Ngắt dòng nếu vượt giới hạn ký tự hoặc quá ~2s
         should_break = (
             len(test_text) > MAX_CHARS_PER_LINE or 
             test_duration > MAX_DURATION_PER_LINE
         )
         
         if should_break and current_words:
-            # Lưu dòng hiện tại
             result_segments.append({
                 "start": start_time,
                 "end": current_words[-1]["end"],
                 "text": current_text.strip()
             })
-            # Bắt đầu dòng mới với từ hiện tại
             current_words = [word]
             current_text = word_text
             start_time = word["start"]
         else:
-            # Thêm vào dòng hiện tại
             current_words.append(word)
             current_text = test_text
     
-    # Thêm dòng cuối cùng
     if current_words:
         result_segments.append({
             "start": start_time,
@@ -197,7 +177,7 @@ def _split_segment_by_words(seg: Dict[str, Any]) -> List[Dict[str, Any]]:
     return result_segments
 
 # -----------------------------
-# Handler
+# Handler - CHỈ TRẢ VỀ FILE SRT
 # -----------------------------
 def handler(event):
     t0 = time.time()
@@ -212,14 +192,12 @@ def handler(event):
 
     beam_size   = int(inp.get("beam_size", 5))
     temperature = float(inp.get("temperature", 0.0))
-    word_ts     = True  # ✨ LUÔN BẬT word timestamps để chia dòng
+    word_ts     = True
     lang = None if str(LANG).lower() == "auto" else LANG
 
     job_id  = str(uuid.uuid4())
     prefix  = inp.get("outfile_prefix") or job_id
-    json_p  = os.path.join(OUT_DIR, f"{prefix}.json")
     srt_p   = os.path.join(OUT_DIR, f"{prefix}.srt")
-    vtt_p   = os.path.join(OUT_DIR, f"{prefix}.vtt")
 
     try:
         model = get_model()
@@ -245,16 +223,13 @@ def handler(event):
         return {"error": f"Transcribe failed: {e}"}
 
     raw_segments: List[Dict[str, Any]] = []
-    words_all: List[Dict[str, Any]] = []
     prev_text = ""
 
-    # Thu thập segments từ model
     for seg in segments_gen:
         if not _is_valid_segment(seg, prev_text):
             continue
         
         item = {
-            "id": seg.id,
             "start": float(seg.start),
             "end": float(seg.end),
             "text": seg.text.strip(),
@@ -263,12 +238,11 @@ def handler(event):
         
         if seg.words:
             item["words"] = [{"start": float(w.start), "end": float(w.end), "word": w.word} for w in seg.words]
-            words_all.extend(item["words"])
         
         raw_segments.append(item)
         prev_text = " ".join([s["text"] for s in raw_segments[-3:]])
 
-    # ✨ CHIA SEGMENTS THÀNH DÒNG NGẮN (~2s/dòng, ít chữ)
+    # ✨ CHIA SEGMENTS THÀNH DÒNG NGẮN
     final_segments: List[Dict[str, Any]] = []
     for seg in raw_segments:
         split_segs = _split_segment_by_words(seg)
@@ -276,55 +250,28 @@ def handler(event):
     
     log.info(f"[SPLIT] {len(raw_segments)} raw segments → {len(final_segments)} final lines")
 
-    # Re-index segments
-    for i, seg in enumerate(final_segments, 1):
-        seg["id"] = i
-
     elapsed = round(time.time() - t0, 2)
     log.info(f"[DONE] {len(final_segments)} lines | {elapsed}s")
 
-    result = {
-        "job_id": job_id,
-        "model_id": MODEL_ID,
-        "language": info.language,
-        "language_probability": float(info.language_probability),
-        "elapsed_sec": elapsed,
-        "num_segments": len(final_segments),
-        "num_words": len(words_all),
-        "text": " ".join([s["text"] for s in final_segments]).strip(),
-        "segments": final_segments,
-        "outputs": {"json": json_p, "srt": None, "vtt": None}
-    }
-
-    with open(json_p, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
+    # GHI FILE SRT
     try:
-        if MAKE_SRT:
-            _write_srt(final_segments, srt_p)
-            result["outputs"]["srt"] = srt_p
-        if MAKE_VTT:
-            _write_vtt(final_segments, vtt_p)
-            result["outputs"]["vtt"] = vtt_p
+        _write_srt(final_segments, srt_p)
     except Exception as e:
-        log.warning(f"[SUBTITLE] {e}")
+        log.error(f"[SUBTITLE] {e}")
+        return {"error": f"Failed to write SRT: {e}"}
 
+    # CLEANUP
     if tmp_dir and os.path.exists(tmp_dir):
         try:
             shutil.rmtree(tmp_dir)
         except Exception as e:
             log.warning(f"[CLEANUP] {e}")
 
-    if inp.get("return", "json") == "text":
-        return {
-            "job_id": job_id,
-            "elapsed_sec": result["elapsed_sec"],
-            "language": result["language"],
-            "path_json": json_p,
-            "path_srt": result["outputs"]["srt"],
-            "text": result["text"]
-        }
-    return result
+    # ✅ CHỈ TRẢ VỀ ĐƯỜNG DẪN FILE SRT
+    return {
+        "srt_path": srt_p,
+        "elapsed_sec": elapsed
+    }
 
 # -----------------------------
 # Runpod serverless entrypoint
